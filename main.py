@@ -1,218 +1,224 @@
-#!/usr/bin/env python3
-"""Forecast GTA VI launch-day Twitch viewers hour by hour (hours 2-24).
+"""gta6-twitch-ccu-forecast-01 entry: kernel-regression forecaster (tuned v2).
 
-Method
-------
-The hour-1 print is the anchor. For every comparable past launch in the case
-file we take its release-day hourly curve and form, for each hour h, the
-log-ratio log(viewers_h / viewers_hour1).  The shape of that curve depends
-strongly on how big the hour-1 print already is: launches whose category
-already had a large audience at 00:00 UTC stay almost flat, while launches
-whose hour-1 print was tiny (new category, rolling midnight unlock still
-ahead) rise many-fold as time zones unlock.  So for each hour we fit a
-local-linear (Gaussian kernel, bandwidth 1.5 in log hour-1 space) regression
-of the log-ratio on log hour-1 print, using the comparables in this very case
-file as the training set.  The predictive spread is the kernel-weighted
-residual standard deviation (floored at 0.25 log units), and the five
-quantiles are the normal quantiles of that local distribution.  The median
-log-ratio is floored at the 5th percentile of the observed log-ratios for
-that hour, so a giant launch is never forecast to collapse far below its
-hour-1 print.  Everything is deterministic, stdlib only, and fast.
+Model, in one paragraph: for each hour h = 2..24 of release day, take every
+comparable past launch's log-ratio log(viewers_h / viewers_1) on its own
+release day and fit it against that launch's log hour-1 print with a
+Gaussian-kernel weighted local-linear regression (bandwidth 2.0 in log
+space), evaluated at this case's log hour-1 print. That fitted value is the
+median log-ratio. The spread is the kernel-weighted root-mean-square
+residual of the same fit, scaled by 0.55 and floored at 0.10 log units, and
+the five quantiles are the median times exp(z_tau * spread) for the standard
+normal z at each level. Everything is computed from the case file at run
+time; nothing about any past case is baked in.
 
-If anything about the data is unexpected the program falls back to the house
-persistence baseline for that case, so the output is always valid.
+Why these numbers: on the four practice cases the unscaled residual spread
+is far too wide (the 90% band covered 100% of scored hours), so the spread
+is scaled down; the wider bandwidth smooths the median across launches and
+keeps the fit stable when hour 1 is larger than any past launch's. Both
+choices were picked by leave-one-out validation over the practice cases,
+not by fitting the practice scores directly.
+
+How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
+python:3.13-slim, standard library only, no network. It reads every
+<id>.in in the input directory and writes <id>.out to the output directory:
+{"hours": [{"hour": 2, "q": [q05, q25, q50, q75, q95]}, ...]}, exactly 23
+rows, hours 2..24 each once, five finite numbers above 0 and at most
+1e9, non-decreasing. Outside the grader, MAKEFUN_INPUT_DIR and
+MAKEFUN_OUTPUT_DIR stand in for /input and /output.
 """
 
 import json
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from pathlib import Path
 
-LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
-BANDWIDTH = 1.5
-SD_FLOOR = 0.25
-MIN_TRAIN = 8
+# The grader's -P leaves /bot off sys.path: put it back first, so a module
+# shipped beside this file would import. (This entry ships no other module.)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+
+# The quantile levels the contest scores, in the order each row lists them.
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+# The standard normal's quantile at each level.
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
+
+# Kernel bandwidth in log hour-1 space for the local-linear fit.
+BANDWIDTH = 2.0
+# The residual spread is scaled down (the raw cross-launch spread is far
+# wider than the conditional spread) and floored, in log units.
+SPREAD_SCALE = 0.55
+SPREAD_FLOOR = 0.10
+# Fallback spread (persistence baseline) if an hour has no donors at all.
+FALLBACK_SIGMA = 0.15
 
 
-def parse_time(text):
-    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+def round2(x: float) -> float | int:
+    """x rounded to 2 decimals, half up, as JavaScript's Math.round(x * 100) / 100.
+
+    A whole number comes back as an int, so json.dumps writes 1240 where
+    JavaScript writes 1240 (not 1240.0). Rounding also keeps two runs
+    byte-identical.
+    """
+    scaled = x * 100
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    value = whole / 100
+    return int(value) if value.is_integer() else value
 
 
-def release_day_series(comp):
-    """Hour -> viewers for a comparable's release day (hours 1..24)."""
-    try:
-        day_start = parse_time(comp["day_start"])
-    except Exception:
-        return {}
-    out = {}
-    for row in comp.get("hourly") or []:
-        try:
-            viewers = row.get("viewers")
-            if not viewers or viewers <= 0:
-                continue
-            t = parse_time(row["from"])
-        except Exception:
+def release_day_ratios(case: dict) -> list[tuple[float, list]]:
+    """Per comparable launch: (log hour-1 print, [log ratio h=2..24]).
+
+    A launch counts only if its release day's first hour has a print; an
+    hour with no print is left as None for that launch. The Grand Theft
+    Auto VI category history has no release-day hour 1 (it starts at the
+    premiere), so it is naturally left out: a trailer spike is not a
+    launch day, and its shape would not transfer.
+    """
+    out = []
+    for comp in case["comparables"]:
+        day_start = comp["day_start"]
+        by_hour = {}
+        for row in comp["hourly"]:
+            by_hour[row["from"]] = row["viewers"]
+        first = by_hour.get(day_start)
+        if not first or first <= 0:
             continue
-        delta = (t - day_start).total_seconds() / 3600.0
-        if 0.0 <= delta < 24.0:
-            out[int(delta) + 1] = float(viewers)
+        ratios = []
+        for h in range(2, 25):
+            # Rebuild the ISO hour stamp for day_start + (h - 1) hours.
+            stamp = shift_hour(day_start, h - 1)
+            viewers = by_hour.get(stamp)
+            if viewers and viewers > 0:
+                ratios.append(math.log(viewers / first))
+            else:
+                ratios.append(None)
+        out.append((math.log(first), ratios))
     return out
 
 
-def hour1_print(case):
-    """Hour-1 print from the known rows, with fallbacks."""
-    known = case.get("known") or []
-    if isinstance(known, dict):
-        known = [known]
-    for row in known:
-        if isinstance(row, dict) and row.get("hour") == 1:
-            value = row.get("viewers")
-            if value and value > 0:
-                return float(value)
-    for row in known:
-        if isinstance(row, dict):
-            value = row.get("viewers")
-            if value and value > 0:
-                return float(value)
-    for key in ("history_hourly", "history"):
-        rows = case.get(key) or []
-        for row in reversed(rows):
-            value = row.get("viewers")
-            if value and value > 0:
-                return float(value)
-    return 1000.0
+def shift_hour(iso: str, hours: int) -> str:
+    """'2022-02-25T00:00:00Z' plus `hours` hours, same format."""
+    year = int(iso[0:4])
+    month = int(iso[5:7])
+    day = int(iso[8:10])
+    hour = int(iso[11:13])
+    # Days in month, with leap years, so the shift stays exact.
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    month_days = [31, 29 if leap else 28, 31, 30, 31, 30,
+                  31, 31, 30, 31, 30, 31]
+    hour += hours
+    while hour >= 24:
+        hour -= 24
+        day += 1
+        if day > month_days[month - 1]:
+            day = 1
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+                leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+                month_days = [31, 29 if leap else 28, 31, 30, 31, 30,
+                              31, 31, 30, 31, 30, 31]
+    return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:00:00Z"
 
 
-def quantile(sorted_values, q):
-    if not sorted_values:
-        return 0.0
-    pos = (len(sorted_values) - 1) * q
-    lo = int(pos)
-    hi = min(lo + 1, len(sorted_values) - 1)
-    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+def local_linear(xs: list[float], ys: list[float], ws: list[float],
+                 x0: float) -> tuple[float, float]:
+    """Gaussian-kernel weighted local-linear fit.
 
-
-def local_linear(points, x, bandwidth):
-    """Kernel-weighted local-linear fit; returns (mu, weighted residual sd)."""
-    weights = []
-    for px, _py in points:
-        d = (px - x) / bandwidth
-        weights.append(math.exp(-0.5 * d * d))
-    total_w = sum(weights)
-    if total_w <= 0.0:
-        return 0.0, 1.0
-    mean_x = sum(w * px for w, (px, _py) in zip(weights, points)) / total_w
-    mean_y = sum(w * py for w, (_px, py) in zip(weights, points)) / total_w
-    sxx = sum(w * (px - mean_x) ** 2 for w, (px, _py) in zip(weights, points))
-    sxy = sum(
-        w * (px - mean_x) * (py - mean_y)
-        for w, (px, py) in zip(weights, points)
-    )
-    slope = sxy / sxx if sxx > 1e-9 else 0.0
+    Returns (prediction at x0, weighted RMS residual around the fit).
+    With no usable slope the fit falls back to the weighted mean.
+    """
+    total_w = sum(ws)
+    mean_x = sum(w * x for w, x in zip(ws, xs)) / total_w
+    mean_y = sum(w * y for w, y in zip(ws, ys)) / total_w
+    sxx = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
+    sxy = sum(w * (x - mean_x) * (y - mean_y)
+              for w, x, y in zip(ws, xs, ys))
+    if sxx <= 1e-12:
+        slope = 0.0
+    else:
+        slope = sxy / sxx
     intercept = mean_y - slope * mean_x
-    mu = intercept + slope * x
-    var = sum(
-        w * (py - (intercept + slope * px)) ** 2
-        for w, (px, py) in zip(weights, points)
-    ) / total_w
-    return mu, math.sqrt(var) if var > 0.0 else 0.0
+    prediction = intercept + slope * x0
+    variance = sum(w * (y - (intercept + slope * x)) ** 2
+                   for w, x, y in zip(ws, xs, ys)) / total_w
+    return prediction, math.sqrt(variance)
 
 
-def forecast_case(case):
-    """Return the 23 forecast rows for one case."""
-    p1 = hour1_print(case)
-    x = math.log(p1)
+def hour_quantiles(p1: float, median_log_ratio: float, spread: float) -> list:
+    """Five quantiles around hour 1's print, non-decreasing, in range."""
+    quantiles = []
+    for z in Z:
+        q = p1 * math.exp(median_log_ratio + z * spread)
+        q = round2(q)
+        if q <= 0:
+            q = 1
+        if q > 1e9:
+            q = 1e9
+        quantiles.append(q)
+    for i in range(1, 5):
+        if quantiles[i] < quantiles[i - 1]:
+            quantiles[i] = quantiles[i - 1]
+    return quantiles
 
-    # Training set: one (log hour-1, log-ratio) point per comparable per hour.
-    training = []
-    for comp in case.get("comparables") or []:
-        series = release_day_series(comp)
-        if 1 not in series:
+
+def forecast_case(case: dict, name: str) -> dict:
+    if case["levels"] != LEVELS:
+        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+    first = next((k for k in case["known"] if k["hour"] == 1), None)
+    if first is None:
+        raise ValueError(f"{name} has no hour-1 print")
+    p1 = max(1, first["viewers"])
+    x0 = math.log(p1)
+    donors = release_day_ratios(case)
+    hours = []
+    for row in case["forecast"]:
+        h = row["hour"]
+        xs, ys, ws = [], [], []
+        for log_h1, ratios in donors:
+            ratio = ratios[h - 2]
+            if ratio is None:
+                continue
+            weight = math.exp(-0.5 * ((log_h1 - x0) / BANDWIDTH) ** 2)
+            xs.append(log_h1)
+            ys.append(ratio)
+            ws.append(weight)
+        if not xs:
+            # No donor has this hour: fall back to the persistence baseline.
+            spread = FALLBACK_SIGMA * math.sqrt(h - 1)
+            hours.append({"hour": h,
+                          "q": hour_quantiles(p1, 0.0, spread)})
             continue
-        present = sum(1 for h in range(2, 25) if h in series)
-        if present < 10:
-            continue
-        training.append(series)
-
-    rows = []
-    for h in range(2, 25):
-        points = []
-        for series in training:
-            if h in series:
-                points.append((math.log(series[1]), math.log(series[h] / series[1])))
-        if len(points) >= MIN_TRAIN:
-            ratios = sorted(py for _px, py in points)
-            floor = quantile(ratios, 0.05)
-            mu, sd = local_linear(points, x, BANDWIDTH)
-            mu = max(mu, floor)
-            sd = max(sd, SD_FLOOR)
-            qs = [p1 * math.exp(mu + z * sd) for z in Z]
-        else:
-            # Too few comparables: fall back to persistence with a widening
-            # spread, exactly the house baseline shape.
-            sigma = 0.15 * math.sqrt(h - 1)
-            qs = [p1 * math.exp(z * sigma) for z in Z]
-        clean = []
-        prev = 1.0
-        for value in qs:
-            value = min(max(value, 1.0), 1e9)
-            value = max(value, prev)
-            clean.append(round(value))
-            prev = value
-        rows.append({"hour": h, "q": clean})
-    return {"hours": rows}
+        # Never extrapolate the fitted line past the donors: if hour 1 is
+        # larger (or smaller) than every past launch's, evaluate the fit at
+        # the edge of the donor range instead of running the slope on.
+        # The weights still use the true hour 1, so the nearest donors
+        # dominate. On the practice cases hour 1 always lies inside the
+        # donor range, so this changes nothing there.
+        x_eval = min(max(x0, min(xs)), max(xs))
+        median_log_ratio, resid_sd = local_linear(xs, ys, ws, x_eval)
+        spread = max(SPREAD_FLOOR, SPREAD_SCALE * resid_sd)
+        hours.append({"hour": h,
+                      "q": hour_quantiles(p1, median_log_ratio, spread)})
+    return {"hours": hours}
 
 
-def baseline_case(case):
-    """House persistence baseline (used only if the model path fails)."""
-    p1 = hour1_print(case)
-    rows = []
-    for h in range(2, 25):
-        sigma = 0.15 * math.sqrt(h - 1)
-        qs = [p1 * math.exp(z * sigma) for z in Z]
-        clean = []
-        prev = 1.0
-        for value in qs:
-            value = min(max(value, 1.0), 1e9)
-            value = max(value, prev)
-            clean.append(round(value))
-            prev = value
-        rows.append({"hour": h, "q": clean})
-    return {"hours": rows}
-
-
-def main():
-    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(output_dir, exist_ok=True)
-    names = sorted(
-        name for name in os.listdir(input_dir) if name.endswith(".in")
-    )
-    for name in names:
-        case_id = name[: -len(".in")]
-        with open(os.path.join(input_dir, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        try:
-            out = forecast_case(case)
-            # Defensive validity check; fall back rather than emit bad output.
-            if len(out["hours"]) != 23:
-                raise ValueError("bad row count")
-            for row in out["hours"]:
-                q = row["q"]
-                if len(q) != 5 or any(v <= 0 or v > 1e9 for v in q):
-                    raise ValueError("bad quantiles")
-                if any(q[i + 1] < q[i] for i in range(4)):
-                    raise ValueError("decreasing quantiles")
-        except Exception:
-            out = baseline_case(case)
-        with open(
-            os.path.join(output_dir, case_id + ".out"), "w", encoding="utf-8"
-        ) as fh:
-            json.dump(out, fh)
-    return 0
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Every case file, in name order, so two runs write the same bytes.
+    for path in sorted(INPUT_DIR.glob("*.in")):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        forecast = forecast_case(case, path.name)
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n",
+            encoding="utf-8")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
